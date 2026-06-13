@@ -1,4 +1,6 @@
 from pathlib import Path
+import os
+import subprocess
 import sys
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -81,6 +83,69 @@ def table_exists(con, table_name):
         ).fetchone()[0]
         > 0
     )
+
+
+def get_tushare_token():
+    token = os.getenv("TUSHARE_TOKEN", "")
+
+    try:
+        secret_token = st.secrets.get("TUSHARE_TOKEN", "")
+        if secret_token:
+            token = secret_token
+    except Exception:
+        pass
+
+    if token:
+        os.environ["TUSHARE_TOKEN"] = str(token)
+
+    return token
+
+
+def real_table_ready():
+    if not DB_PATH.exists():
+        return False
+
+    try:
+        check_con = duckdb.connect(str(DB_PATH), read_only=True)
+        ok = table_exists(check_con, ANALYTICS_TABLE)
+        if ok:
+            row_count = check_con.execute(f"select count(*) from {ANALYTICS_TABLE}").fetchone()[0]
+            ok = row_count > 0
+        check_con.close()
+        return ok
+    except Exception:
+        return False
+
+
+def run_cloud_extract(days=180):
+    token = get_tushare_token()
+    if not token:
+        raise RuntimeError("未检测到 TUSHARE_TOKEN，请先在 Streamlit Cloud Secrets 中配置。")
+
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "src.extract",
+        "--days",
+        str(days),
+    ]
+
+    result = subprocess.run(
+        cmd,
+        cwd=str(ROOT_DIR),
+        env=os.environ.copy(),
+        capture_output=True,
+        text=True,
+        timeout=1200,
+    )
+
+    if result.returncode != 0:
+        error_message = result.stderr or result.stdout or "未知错误"
+        raise RuntimeError(error_message[-4000:])
+
+    return result.stdout[-4000:]
 
 
 def ensure_demo_data(con):
@@ -293,6 +358,31 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+with st.sidebar:
+    st.subheader("数据更新")
+    st.caption("云端部署版可通过 Tushare Token 拉取真实 A 股数据。")
+
+    update_days = st.number_input(
+        "拉取最近 N 天数据",
+        min_value=30,
+        max_value=365,
+        value=180,
+        step=30,
+    )
+
+    if st.button("拉取 / 更新真实数据", type="primary"):
+        try:
+            st.cache_resource.clear()
+            with st.spinner("正在云端拉取 Tushare 数据并生成 DuckDB，请稍等..."):
+                log_text = run_cloud_extract(days=int(update_days))
+            st.success("真实数据更新完成，正在刷新页面。")
+            with st.expander("查看抽取日志"):
+                st.code(log_text)
+            st.rerun()
+        except Exception as exc:
+            st.error("真实数据更新失败。")
+            st.code(str(exc))
 
 con = get_connection()
 source_table, source_label = choose_source_table(con)
