@@ -71,6 +71,16 @@ def get_connection():
     return duckdb.connect(str(DB_PATH))
 
 
+def close_cached_connection():
+    try:
+        con = get_connection()
+        con.close()
+    except Exception:
+        pass
+
+    st.cache_resource.clear()
+
+
 def table_exists(con, table_name):
     return (
         con.execute(
@@ -372,17 +382,22 @@ with st.sidebar:
     )
 
     if st.button("拉取 / 更新真实数据", type="primary"):
-        try:
-            st.cache_resource.clear()
-            with st.spinner("正在云端拉取 Tushare 数据并生成 DuckDB，请稍等..."):
-                log_text = run_cloud_extract(days=int(update_days))
-            st.success("真实数据更新完成，正在刷新页面。")
-            with st.expander("查看抽取日志"):
-                st.code(log_text)
-            st.rerun()
-        except Exception as exc:
-            st.error("真实数据更新失败。")
-            st.code(str(exc))
+    try:
+        close_cached_connection()
+
+        with st.spinner("正在云端拉取 Tushare 数据并生成 DuckDB，请稍等..."):
+            log_text = run_cloud_extract(days=int(update_days))
+
+        st.cache_resource.clear()
+        st.success("真实数据更新完成，正在刷新页面。")
+
+        with st.expander("查看抽取日志"):
+            st.code(log_text)
+
+        st.rerun()
+    except Exception as exc:
+        st.error("真实数据更新失败。")
+        st.code(str(exc))
 
 con = get_connection()
 source_table, source_label = choose_source_table(con)
