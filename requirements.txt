@@ -1,0 +1,6 @@
+duckdb
+pandas
+plotly
+python-dotenv
+streamlit
+tushare

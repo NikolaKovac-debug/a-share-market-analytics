@@ -1,0 +1,34 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.streamlit/
+data/database/*.duckdb
+data/database/*.duckdb.wal
+data/database/*.wal
+data/raw/*.csv
+data/processed/*.csv
+
+# Local notebooks / reports generated during exploration
+reports/figures/
+
+# Unrelated local experiments in this workspace
+all_a_wind_ml_data/
+github_pages/
+hs300_momentum_backtest/
+hs300_momentum_live_signal/
+outputs/
+vendor/
+*.zip
+index.html
+script.js
+style.css
+server.py
+minesweeper.py
+install_sqljs.ps1
+requirements-akshare.txt
+sql_practice*.html
+sql_practice*.js
+sql_practice*.css
+sql_server.py
