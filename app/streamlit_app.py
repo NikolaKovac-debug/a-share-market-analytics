@@ -381,7 +381,7 @@ with st.sidebar:
         step=30,
     )
 
-    if st.button("拉取 / 更新真实数据", type="primary"):
+if st.button("拉取 / 更新真实数据", type="primary"):
     try:
         close_cached_connection()
 
@@ -395,6 +395,7 @@ with st.sidebar:
             st.code(log_text)
 
         st.rerun()
+
     except Exception as exc:
         st.error("真实数据更新失败。")
         st.code(str(exc))
