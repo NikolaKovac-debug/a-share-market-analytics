@@ -345,6 +345,13 @@ def z_to_score(z_value, neutral=50, scale=15):
     return clamp(neutral + float(z_value) * scale)
 
 
+def percentile_score(series):
+    numeric = pd.to_numeric(series, errors="coerce")
+    if numeric.notna().sum() < 5 or numeric.nunique(dropna=True) <= 1:
+        return pd.Series(50.0, index=series.index)
+    return numeric.rank(pct=True) * 100
+
+
 def classify_market_regime(score, risk_ratio):
     if pd.isna(score):
         return "样本不足"
@@ -385,20 +392,50 @@ def regime_interpretation(regime):
     return mapping.get(regime, "市场状态需要结合成交、宽度和风险指标共同观察。")
 
 
+def add_market_score_columns(df):
+    result = df.copy()
+    result["limit_up_intensity"] = result["limit_up_count"] / result["stock_count"].replace(0, pd.NA)
+    result["risk_ratio"] = pd.to_numeric(result["risk_ratio"], errors="coerce").fillna(0.2)
+
+    result["turnover_score"] = percentile_score(result["turnover_100m"])
+    result["return_score"] = percentile_score(result["avg_return"])
+    result["breadth_score"] = percentile_score(result["up_ratio"])
+    result["limit_up_score"] = percentile_score(result["limit_up_intensity"])
+    result["risk_control_score"] = 100 - percentile_score(result["risk_ratio"])
+
+    result["market_heat_score"] = (
+        0.25 * result["turnover_score"]
+        + 0.25 * result["breadth_score"]
+        + 0.20 * result["return_score"]
+        + 0.15 * result["limit_up_score"]
+        + 0.15 * result["risk_control_score"]
+    ).clip(0, 100)
+    return result
+
+
 def build_market_score_detail(trend_row, risk_ratio):
-    turnover_score = z_to_score(trend_row.get("turnover_100m_z20", float("nan")))
-    return_score = z_to_score(trend_row.get("avg_return_z20", float("nan")))
-    breadth_score = z_to_score(trend_row.get("up_ratio_z20", float("nan")))
-    limit_up_score = clamp(trend_row.get("limit_up_count", 0) / max(trend_row.get("stock_count", 1), 1) * 1000)
-    if pd.isna(risk_ratio):
-        risk_ratio = 0.2
-    risk_control_score = 100 - clamp(risk_ratio * 100)
+    if "turnover_score" in trend_row:
+        turnover_score = trend_row.get("turnover_score", float("nan"))
+        return_score = trend_row.get("return_score", float("nan"))
+        breadth_score = trend_row.get("breadth_score", float("nan"))
+        limit_up_score = trend_row.get("limit_up_score", float("nan"))
+        risk_control_score = trend_row.get("risk_control_score", float("nan"))
+        explanation_suffix = "基于当前样本期历史分位数"
+    else:
+        turnover_score = z_to_score(trend_row.get("turnover_100m_z20", float("nan")))
+        return_score = z_to_score(trend_row.get("avg_return_z20", float("nan")))
+        breadth_score = z_to_score(trend_row.get("up_ratio_z20", float("nan")))
+        limit_up_score = clamp(trend_row.get("limit_up_count", 0) / max(trend_row.get("stock_count", 1), 1) * 1000)
+        if pd.isna(risk_ratio):
+            risk_ratio = 0.2
+        risk_control_score = 100 - clamp(risk_ratio * 100)
+        explanation_suffix = "基于20日z-score映射"
     components = [
-        {"指标": "成交活跃度", "权重": 0.30, "分项得分": turnover_score, "解释": "成交额相对20日均值的z-score"},
-        {"指标": "收益强度", "权重": 0.25, "分项得分": return_score, "解释": "等权平均涨跌幅相对20日均值的z-score"},
-        {"指标": "市场宽度", "权重": 0.25, "分项得分": breadth_score, "解释": "上涨占比相对20日均值的z-score"},
-        {"指标": "涨停热度", "权重": 0.10, "分项得分": limit_up_score, "解释": "涨停代理数量 / 股票数量"},
-        {"指标": "风险惩罚", "权重": 0.10, "分项得分": risk_control_score, "解释": "风险样本占比越高，该项得分越低"},
+        {"指标": "成交活跃度", "权重": 0.25, "分项得分": turnover_score, "解释": f"成交额强弱，{explanation_suffix}"},
+        {"指标": "市场宽度", "权重": 0.25, "分项得分": breadth_score, "解释": f"上涨占比强弱，{explanation_suffix}"},
+        {"指标": "收益强度", "权重": 0.20, "分项得分": return_score, "解释": f"等权平均涨跌幅强弱，{explanation_suffix}"},
+        {"指标": "涨停热度", "权重": 0.15, "分项得分": limit_up_score, "解释": "涨停代理占比在样本期中的历史位置"},
+        {"指标": "风险控制", "权重": 0.15, "分项得分": risk_control_score, "解释": "风险样本占比越高，该项得分越低"},
     ]
     score = sum(item["权重"] * item["分项得分"] for item in components)
     return clamp(score), components
@@ -630,7 +667,9 @@ trend_df = add_rolling_zscore(trend_df, "turnover_100m", window=20, min_periods=
 trend_df = add_rolling_zscore(trend_df, "avg_return", window=20, min_periods=10)
 trend_df = add_rolling_zscore(trend_df, "up_ratio", window=20, min_periods=10)
 
-latest_trend = trend_df.dropna(subset=["trade_date"]).tail(1)
+latest_trend = trend_df[trend_df["trade_date"].dt.date == selected_date].tail(1)
+if latest_trend.empty:
+    latest_trend = trend_df.dropna(subset=["trade_date"]).tail(1)
 latest_turnover_z = latest_trend["turnover_100m_z20"].iloc[0] if not latest_trend.empty else float("nan")
 latest_return_z = latest_trend["avg_return_z20"].iloc[0] if not latest_trend.empty else float("nan")
 latest_up_ratio_z = latest_trend["up_ratio_z20"].iloc[0] if not latest_trend.empty else float("nan")
@@ -640,11 +679,6 @@ risk_today_df = risk_feature_df[risk_feature_df["trade_date"].dt.date == selecte
 risk_today_df["risk_reason"] = risk_today_df.apply(build_risk_reason, axis=1)
 risk_alert_df = risk_today_df[risk_today_df["high_risk_flag"]].copy()
 risk_ratio = len(risk_alert_df) / len(risk_today_df) if len(risk_today_df) else float("nan")
-latest_trend_row = latest_trend.iloc[0].to_dict() if not latest_trend.empty else {}
-market_heat_score, market_score_components = build_market_score_detail(latest_trend_row, risk_ratio)
-market_regime = classify_market_regime(market_heat_score, risk_ratio)
-market_regime_note = regime_interpretation(market_regime)
-industry_signal_df = build_industry_signal_frame(filtered_base_df, filtered_df)
 
 risk_ratio_by_date = (
     risk_feature_df.groupby("trade_date", as_index=False)
@@ -652,14 +686,19 @@ risk_ratio_by_date = (
     .sort_values("trade_date")
 )
 trend_signal_df = trend_df.merge(risk_ratio_by_date, on="trade_date", how="left")
-trend_signal_df["market_heat_score"] = trend_signal_df.apply(
-    lambda row: build_market_score(row.to_dict(), row.get("risk_ratio", float("nan"))),
-    axis=1,
-)
+trend_signal_df = add_market_score_columns(trend_signal_df)
 trend_signal_df["market_regime"] = trend_signal_df.apply(
     lambda row: classify_market_regime(row["market_heat_score"], row.get("risk_ratio", float("nan"))),
     axis=1,
 )
+selected_trend_signal = trend_signal_df[trend_signal_df["trade_date"].dt.date == selected_date].tail(1)
+if selected_trend_signal.empty:
+    selected_trend_signal = trend_signal_df.dropna(subset=["trade_date"]).tail(1)
+latest_trend_row = selected_trend_signal.iloc[0].to_dict() if not selected_trend_signal.empty else {}
+market_heat_score, market_score_components = build_market_score_detail(latest_trend_row, risk_ratio)
+market_regime = classify_market_regime(market_heat_score, risk_ratio)
+market_regime_note = regime_interpretation(market_regime)
+industry_signal_df = build_industry_signal_frame(filtered_base_df, filtered_df)
 
 tab_overview, tab_trend, tab_research, tab_risk, tab_sql, tab_report, tab_industry, tab_movers, tab_detail = st.tabs(
     ["市场总览", "半年趋势", "市场状态研究", "风险监控", "SQL样例", "研究报告", "行业透视", "涨跌幅榜", "个股明细"]
@@ -728,13 +767,13 @@ with tab_overview:
             """
             **评分口径**
 
-            - `成交活跃度`：成交额相对过去 20 日的 z-score，权重 30%。
-            - `收益强度`：等权平均涨跌幅相对过去 20 日的 z-score，权重 25%。
-            - `市场宽度`：上涨占比相对过去 20 日的 z-score，权重 25%。
-            - `涨停热度`：涨停代理数量占比，权重 10%。
-            - `风险惩罚`：风险预警股票占比越高，该项得分越低，权重 10%。
+            - `成交活跃度`：成交额在当前样本期中的历史分位数，权重 25%。
+            - `市场宽度`：上涨占比在当前样本期中的历史分位数，权重 25%。
+            - `收益强度`：等权平均涨跌幅在当前样本期中的历史分位数，权重 20%。
+            - `涨停热度`：涨停代理占比在当前样本期中的历史分位数，权重 15%。
+            - `风险控制`：风险预警股票占比分位数的反向得分，权重 15%。
 
-            单个 z-score 分项会先转换为 `50 + 15 * z`，再限制在 0 到 100 之间。
+            这版评分采用历史分位数而不是单纯 z-score 映射，目的是让不同交易日之间的冷热差异更明显。
             """
         )
         component_df = pd.DataFrame(market_score_components)
@@ -1030,22 +1069,30 @@ with daily_market as (
     from analytics_market_daily
     group by trade_date
 ),
-zscore_base as (
+score_base as (
     select
         *,
-        (turnover_100m - avg(turnover_100m) over w) / nullif(stddev(turnover_100m) over w, 0) as turnover_z20,
-        (avg_return - avg(avg_return) over w) / nullif(stddev(avg_return) over w, 0) as return_z20,
-        (up_ratio - avg(up_ratio) over w) / nullif(stddev(up_ratio) over w, 0) as breadth_z20
+        limit_up_count / nullif(stock_count, 0) as limit_up_intensity,
+        percent_rank() over (order by turnover_100m) * 100 as turnover_score,
+        percent_rank() over (order by avg_return) * 100 as return_score,
+        percent_rank() over (order by up_ratio) * 100 as breadth_score,
+        percent_rank() over (order by limit_up_count / nullif(stock_count, 0)) * 100 as limit_up_score
     from daily_market
-    window w as (order by trade_date rows between 19 preceding and current row)
 )
 select
     trade_date,
-    round(turnover_z20, 2) as turnover_z20,
-    round(return_z20, 2) as return_z20,
-    round(breadth_z20, 2) as breadth_z20,
-    round(50 + 15 * turnover_z20 + 10 * return_z20 + 10 * breadth_z20, 2) as raw_market_heat_score
-from zscore_base
+    round(turnover_score, 2) as turnover_score,
+    round(breadth_score, 2) as breadth_score,
+    round(return_score, 2) as return_score,
+    round(limit_up_score, 2) as limit_up_score,
+    round(
+        0.25 * turnover_score
+        + 0.25 * breadth_score
+        + 0.20 * return_score
+        + 0.15 * limit_up_score,
+        2
+    ) as market_heat_score_without_risk
+from score_base
 where trade_date = date '{selected_date}';
 """,
         "20日波动率监控": f"""
