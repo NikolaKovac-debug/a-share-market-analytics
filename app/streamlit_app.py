@@ -333,6 +333,127 @@ def dataframe_to_csv_bytes(df):
     return df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
 
 
+def clamp(value, lower=0, upper=100):
+    if pd.isna(value):
+        return float("nan")
+    return max(lower, min(upper, float(value)))
+
+
+def z_to_score(z_value, neutral=50, scale=15):
+    if pd.isna(z_value):
+        return neutral
+    return clamp(neutral + float(z_value) * scale)
+
+
+def classify_market_regime(score, risk_ratio):
+    if pd.isna(score):
+        return "样本不足"
+    if pd.isna(risk_ratio):
+        risk_ratio = 0.2
+    if risk_ratio >= 0.35 and score >= 65:
+        return "过热高波动"
+    if risk_ratio >= 0.35 and score < 50:
+        return "风险释放"
+    if score >= 70:
+        return "Risk-on 扩张"
+    if score <= 35:
+        return "Risk-off 收缩"
+    return "结构分化"
+
+
+def regime_interpretation(regime):
+    mapping = {
+        "Risk-on 扩张": "上涨扩散、成交活跃，适合观察强势行业能否持续扩散。",
+        "Risk-off 收缩": "市场宽度和成交活跃度偏弱，风险偏好处于收缩区间。",
+        "过热高波动": "赚钱效应较强但风险样本偏多，可能存在交易拥挤或短期过热。",
+        "风险释放": "风险股票占比较高且市场温度不足，适合重点监控回撤与流动性压力。",
+        "结构分化": "市场没有单边状态，行业轮动和个股分化是主要观察对象。",
+        "样本不足": "当前滚动窗口不足，暂不做稳定状态判断。",
+    }
+    return mapping.get(regime, "市场状态需要结合成交、宽度和风险指标共同观察。")
+
+
+def build_market_score(trend_row, risk_ratio):
+    turnover_score = z_to_score(trend_row.get("turnover_100m_z20", float("nan")))
+    return_score = z_to_score(trend_row.get("avg_return_z20", float("nan")))
+    breadth_score = z_to_score(trend_row.get("up_ratio_z20", float("nan")))
+    limit_up_score = clamp(trend_row.get("limit_up_count", 0) / max(trend_row.get("stock_count", 1), 1) * 1000)
+    if pd.isna(risk_ratio):
+        risk_ratio = 0.2
+    risk_penalty = clamp(risk_ratio * 100)
+    score = (
+        0.30 * turnover_score
+        + 0.25 * return_score
+        + 0.25 * breadth_score
+        + 0.10 * limit_up_score
+        + 0.10 * (100 - risk_penalty)
+    )
+    return clamp(score)
+
+
+def describe_industry_signal(row):
+    crowding = row.get("crowding_z20", float("nan"))
+    avg_return_value = row.get("avg_return", float("nan"))
+    up_ratio_value = row.get("up_ratio", float("nan"))
+    if pd.notna(crowding) and crowding >= 2 and avg_return_value > 0:
+        return "高拥挤强势"
+    if pd.notna(crowding) and crowding >= 2 and avg_return_value <= 0:
+        return "放量分歧"
+    if avg_return_value > 1 and up_ratio_value >= 0.6:
+        return "扩散上涨"
+    if avg_return_value < -1 and up_ratio_value <= 0.4:
+        return "弱势扩散"
+    if pd.notna(crowding) and crowding <= -1:
+        return "成交低位"
+    return "中性观察"
+
+
+def build_industry_signal_frame(base_df, current_df):
+    history = (
+        base_df.groupby(["trade_date", "industry_label"], as_index=False)
+        .agg(
+            stock_count=("ts_code", "count"),
+            turnover_100m=("amount_100m", "sum"),
+            avg_return=("pct_chg", "mean"),
+            up_ratio=("is_up", "mean"),
+            net_flow_100m=("net_mf_amount_100m", "sum"),
+        )
+        .sort_values(["industry_label", "trade_date"])
+    )
+    if history.empty:
+        return pd.DataFrame()
+
+    grouped = history.groupby("industry_label", group_keys=False)
+    history["turnover_ma20"] = grouped["turnover_100m"].rolling(20, min_periods=5).mean().reset_index(level=0, drop=True)
+    history["turnover_std20"] = grouped["turnover_100m"].rolling(20, min_periods=5).std().reset_index(level=0, drop=True)
+    history["crowding_z20"] = (history["turnover_100m"] - history["turnover_ma20"]) / history["turnover_std20"]
+    history["return_ma20"] = grouped["avg_return"].rolling(20, min_periods=5).mean().reset_index(level=0, drop=True)
+    history["relative_return_20d"] = history["avg_return"] - history["return_ma20"]
+
+    current_date = current_df["trade_date"].dt.normalize().max()
+    signal_df = history[history["trade_date"].dt.normalize() == current_date].copy()
+    if signal_df.empty:
+        return signal_df
+    signal_df["signal_label"] = signal_df.apply(describe_industry_signal, axis=1)
+    signal_df["crowding_score"] = signal_df["crowding_z20"].apply(lambda value: z_to_score(value))
+    return signal_df.sort_values(["crowding_z20", "turnover_100m"], ascending=[False, False])
+
+
+def build_risk_reason(row):
+    reasons = []
+    if bool(row.get("abnormal_return_flag", False)):
+        reasons.append(f"涨跌幅偏离20日均值，z={row.get('return_zscore_20d', float('nan')):.2f}")
+    if bool(row.get("abnormal_turnover_flag", False)):
+        reasons.append(f"成交额显著放大，z={row.get('turnover_zscore_20d', float('nan')):.2f}")
+    if bool(row.get("high_volatility_flag", False)):
+        reasons.append(f"20日波动率较高，vol={row.get('return_vol_20d', float('nan')):.2f}")
+    if bool(row.get("deep_drawdown_flag", False)):
+        reasons.append(f"20日回撤较深，drawdown={row.get('drawdown_20d', float('nan')):.2f}%")
+    if row.get("consecutive_down_days", 0) >= 3:
+        reasons.append(f"连续下跌{int(row.get('consecutive_down_days', 0))}天")
+    return "；".join(reasons) if reasons else "未触发核心风控规则"
+
+
 st.set_page_config(page_title="A股市场结构分析终端", layout="wide")
 
 st.markdown(
@@ -498,13 +619,47 @@ latest_up_ratio_z = latest_trend["up_ratio_z20"].iloc[0] if not latest_trend.emp
 up_ratio_half_life = estimate_ar1_half_life(trend_df["up_ratio"])
 risk_feature_df = build_stock_risk_features(filtered_base_df)
 risk_today_df = risk_feature_df[risk_feature_df["trade_date"].dt.date == selected_date].copy()
+risk_today_df["risk_reason"] = risk_today_df.apply(build_risk_reason, axis=1)
 risk_alert_df = risk_today_df[risk_today_df["high_risk_flag"]].copy()
+risk_ratio = len(risk_alert_df) / len(risk_today_df) if len(risk_today_df) else float("nan")
+latest_trend_row = latest_trend.iloc[0].to_dict() if not latest_trend.empty else {}
+market_heat_score = build_market_score(latest_trend_row, risk_ratio)
+market_regime = classify_market_regime(market_heat_score, risk_ratio)
+market_regime_note = regime_interpretation(market_regime)
+industry_signal_df = build_industry_signal_frame(filtered_base_df, filtered_df)
+
+risk_ratio_by_date = (
+    risk_feature_df.groupby("trade_date", as_index=False)
+    .agg(risk_ratio=("high_risk_flag", "mean"))
+    .sort_values("trade_date")
+)
+trend_signal_df = trend_df.merge(risk_ratio_by_date, on="trade_date", how="left")
+trend_signal_df["market_heat_score"] = trend_signal_df.apply(
+    lambda row: build_market_score(row.to_dict(), row.get("risk_ratio", float("nan"))),
+    axis=1,
+)
+trend_signal_df["market_regime"] = trend_signal_df.apply(
+    lambda row: classify_market_regime(row["market_heat_score"], row.get("risk_ratio", float("nan"))),
+    axis=1,
+)
 
 tab_overview, tab_trend, tab_research, tab_risk, tab_sql, tab_report, tab_industry, tab_movers, tab_detail = st.tabs(
     ["市场总览", "半年趋势", "市场状态研究", "风险监控", "SQL样例", "研究报告", "行业透视", "涨跌幅榜", "个股明细"]
 )
 
 with tab_overview:
+    signal_cols = st.columns(4)
+    with signal_cols[0]:
+        render_metric("市场温度评分", "-" if pd.isna(market_heat_score) else f"{market_heat_score:.1f}/100", market_regime)
+    with signal_cols[1]:
+        render_metric("状态解释", market_regime, market_regime_note)
+    with signal_cols[2]:
+        render_metric("风险样本占比", "-" if pd.isna(risk_ratio) else f"{risk_ratio:.1%}", "风险监控股票 / 当日样本")
+    with signal_cols[3]:
+        hot_industry = industry_signal_df.iloc[0]["industry_label"] if not industry_signal_df.empty else "-"
+        hot_label = industry_signal_df.iloc[0]["signal_label"] if not industry_signal_df.empty else "样本不足"
+        render_metric("最拥挤行业", hot_industry, hot_label)
+
     col1, col2 = st.columns(2)
     with col1:
         fig = px.bar(
@@ -540,6 +695,15 @@ with tab_overview:
         labels={"market_label": "板块", "turnover_100m": "成交额（亿元）", "avg_return": "平均涨跌幅"},
     )
     st.plotly_chart(style_plotly(fig), use_container_width=True)
+
+    st.markdown(
+        """
+        **分析框架**
+
+        本页不是替代东方财富这类数据中心，而是把行情加工成可解释信号：
+        市场温度用于判断风险偏好，行业拥挤度用于观察交易是否集中，风险监控用于定位异常样本。
+        """
+    )
 
 with tab_trend:
     col1, col2 = st.columns(2)
@@ -594,6 +758,19 @@ with tab_trend:
         )
         st.plotly_chart(style_plotly(fig), use_container_width=True)
 
+    fig = px.line(
+        trend_signal_df,
+        x="trade_date",
+        y="market_heat_score",
+        color="market_regime",
+        markers=True,
+        title="市场温度评分趋势",
+        labels={"trade_date": "交易日期", "market_heat_score": "市场温度评分", "market_regime": "市场状态"},
+    )
+    fig.add_hline(y=70, line_dash="dash", line_color="#b45309")
+    fig.add_hline(y=35, line_dash="dash", line_color="#1f4e79")
+    st.plotly_chart(style_plotly(fig), use_container_width=True)
+
 with tab_research:
     st.subheader("均值回归与市场状态识别")
     st.caption(
@@ -611,6 +788,14 @@ with tab_research:
     with research_cols[3]:
         half_life_value = up_ratio_half_life["half_life"]
         render_metric("上涨占比半衰期", "-" if pd.isna(half_life_value) else f"{half_life_value:.1f} 日", up_ratio_half_life["interpretation"])
+
+    market_score_text = "-" if pd.isna(market_heat_score) else f"{market_heat_score:.1f}/100"
+    risk_ratio_text = "-" if pd.isna(risk_ratio) else f"{risk_ratio:.1%}"
+    st.info(
+        f"当前市场状态识别为：{market_regime}。"
+        f"市场温度评分 {market_score_text}，风险样本占比 {risk_ratio_text}。"
+        f"{market_regime_note}"
+    )
 
     col1, col2 = st.columns(2)
     with col1:
@@ -703,6 +888,7 @@ with tab_risk:
             "drawdown_20d",
             "consecutive_down_days",
             "high_risk_flag",
+            "risk_reason",
         ]
     ].rename(
         columns={
@@ -717,6 +903,7 @@ with tab_risk:
             "drawdown_20d": "20日回撤",
             "consecutive_down_days": "连续下跌天数",
             "high_risk_flag": "风险标记",
+            "risk_reason": "触发原因",
         }
     )
     st.dataframe(
@@ -776,6 +963,36 @@ from analytics_market_daily
 where trade_date = date '{selected_date}'
 group by coalesce(industry, '未分类行业')
 order by turnover_100m desc;
+""",
+        "市场温度评分框架": f"""
+with daily_market as (
+    select
+        trade_date,
+        count(*) as stock_count,
+        sum(amount_100m) as turnover_100m,
+        avg(pct_chg) as avg_return,
+        avg(case when is_up then 1 else 0 end) as up_ratio,
+        sum(case when is_limit_up_proxy then 1 else 0 end) as limit_up_count
+    from analytics_market_daily
+    group by trade_date
+),
+zscore_base as (
+    select
+        *,
+        (turnover_100m - avg(turnover_100m) over w) / nullif(stddev(turnover_100m) over w, 0) as turnover_z20,
+        (avg_return - avg(avg_return) over w) / nullif(stddev(avg_return) over w, 0) as return_z20,
+        (up_ratio - avg(up_ratio) over w) / nullif(stddev(up_ratio) over w, 0) as breadth_z20
+    from daily_market
+    window w as (order by trade_date rows between 19 preceding and current row)
+)
+select
+    trade_date,
+    round(turnover_z20, 2) as turnover_z20,
+    round(return_z20, 2) as return_z20,
+    round(breadth_z20, 2) as breadth_z20,
+    round(50 + 15 * turnover_z20 + 10 * return_z20 + 10 * breadth_z20, 2) as raw_market_heat_score
+from zscore_base
+where trade_date = date '{selected_date}';
 """,
         "20日波动率监控": f"""
 with risk_base as (
@@ -838,6 +1055,42 @@ where trade_date between date '{selected_date}' - interval 20 day and date '{sel
 group by coalesce(industry, '未分类行业')
 having count(*) >= 20
 order by avg_return desc;
+""",
+        "行业拥挤度识别": f"""
+with industry_daily as (
+    select
+        trade_date,
+        coalesce(industry, '未分类行业') as industry,
+        count(*) as stock_count,
+        sum(amount_100m) as turnover_100m,
+        avg(pct_chg) as avg_return,
+        avg(case when is_up then 1 else 0 end) as up_ratio
+    from analytics_market_daily
+    group by trade_date, coalesce(industry, '未分类行业')
+),
+industry_signal as (
+    select
+        *,
+        (turnover_100m - avg(turnover_100m) over w) / nullif(stddev(turnover_100m) over w, 0) as crowding_z20,
+        avg_return - avg(avg_return) over w as relative_return_20d
+    from industry_daily
+    window w as (
+        partition by industry
+        order by trade_date
+        rows between 19 preceding and current row
+    )
+)
+select
+    industry,
+    stock_count,
+    round(turnover_100m, 2) as turnover_100m,
+    round(avg_return, 2) as avg_return,
+    round(up_ratio, 4) as up_ratio,
+    round(crowding_z20, 2) as crowding_z20,
+    round(relative_return_20d, 2) as relative_return_20d
+from industry_signal
+where trade_date = date '{selected_date}'
+order by crowding_z20 desc nulls last;
 """,
         "资金流背离": f"""
 select
@@ -962,20 +1215,25 @@ with tab_report:
     st.subheader("自动研究报告")
     top_industry_name = industry_df.iloc[0]["industry_label"] if not industry_df.empty else "-"
     top_industry_turnover = industry_df.iloc[0]["turnover_100m"] if not industry_df.empty else float("nan")
+    top_signal_industry = industry_signal_df.iloc[0]["industry_label"] if not industry_signal_df.empty else "-"
+    top_signal_label = industry_signal_df.iloc[0]["signal_label"] if not industry_signal_df.empty else "样本不足"
+    top_signal_z = industry_signal_df.iloc[0]["crowding_z20"] if not industry_signal_df.empty else float("nan")
     risk_count = len(risk_alert_df)
     report_text = f"""
 ### 市场状态摘要
 
 - 当前交易日为 **{selected_date}**，筛选范围内共有 **{len(filtered_df):,}** 只股票。
 - 当日成交额合计 **{format_amount(total_turnover)}**，等权平均涨跌幅为 **{format_pct(avg_return)}**，上涨占比为 **{"-" if pd.isna(up_ratio) else f"{up_ratio:.1%}"}**。
+- 市场温度评分为 **{"-" if pd.isna(market_heat_score) else f"{market_heat_score:.1f}/100"}**，状态识别为 **{market_regime}**。{market_regime_note}
 - 成交额最高的行业为 **{top_industry_name}**，成交额约 **{format_amount(top_industry_turnover)}**。
+- 当前成交最拥挤行业为 **{top_signal_industry}**，拥挤度 z-score 为 **{"-" if pd.isna(top_signal_z) else f"{top_signal_z:.2f}"}**，信号标签：**{top_signal_label}**。
 - 当前成交额 z-score 为 **{"-" if pd.isna(latest_turnover_z) else f"{latest_turnover_z:.2f}"}**，状态判断：**{classify_zscore(latest_turnover_z)}**。
 - 当前上涨占比 z-score 为 **{"-" if pd.isna(latest_up_ratio_z) else f"{latest_up_ratio_z:.2f}"}**，状态判断：**{classify_zscore(latest_up_ratio_z)}**。
 - 风控模块识别出 **{risk_count:,}** 只风险预警股票，主要依据包括异常涨跌幅、异常放量、高波动和 20 日深度回撤。
 
 ### 研究解释
 
-本项目将市场宽度、成交额、行业结构和个股风险指标纳入统一分析框架。滚动 z-score 用于衡量当前市场状态相对于近期历史分布的偏离程度；AR(1) 半衰期用于描述市场宽度指标偏离均值后的回归速度；个股层面的风险监控则通过波动率、成交额 z-score、回撤和连续下跌天数识别潜在异常样本。
+本项目将市场宽度、成交额、行业结构和个股风险指标纳入统一分析框架。滚动 z-score 用于衡量当前市场状态相对于近期历史分布的偏离程度；AR(1) 半衰期用于描述市场宽度指标偏离均值后的回归速度；行业拥挤度用于识别成交是否集中在少数方向；个股层面的风险监控则通过波动率、成交额 z-score、回撤和连续下跌天数识别潜在异常样本，并给出可解释的触发原因。
 """
     st.markdown(report_text)
     st.download_button(
@@ -986,6 +1244,68 @@ with tab_report:
     )
 
 with tab_industry:
+    st.subheader("行业轮动与拥挤度信号")
+    st.caption("用行业成交额 20 日 z-score 衡量交易拥挤度，并结合行业平均收益和上涨占比给出状态标签。")
+
+    if not industry_signal_df.empty:
+        industry_signal_display_df = industry_signal_df[
+            [
+                "industry_label",
+                "stock_count",
+                "turnover_100m",
+                "avg_return",
+                "up_ratio",
+                "crowding_z20",
+                "relative_return_20d",
+                "signal_label",
+            ]
+        ].rename(
+            columns={
+                "industry_label": "行业",
+                "stock_count": "股票数量",
+                "turnover_100m": "成交额_亿元",
+                "avg_return": "平均涨跌幅",
+                "up_ratio": "上涨占比",
+                "crowding_z20": "拥挤度z值",
+                "relative_return_20d": "相对20日收益",
+                "signal_label": "信号标签",
+            }
+        )
+        st.dataframe(
+            industry_signal_display_df.style.format(
+                {
+                    "成交额_亿元": "{:,.2f}",
+                    "平均涨跌幅": "{:.2f}",
+                    "上涨占比": "{:.1%}",
+                    "拥挤度z值": "{:.2f}",
+                    "相对20日收益": "{:.2f}",
+                },
+                na_rep="-",
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        fig = px.scatter(
+            industry_signal_df,
+            x="crowding_z20",
+            y="avg_return",
+            size="turnover_100m",
+            color="signal_label",
+            hover_name="industry_label",
+            title="行业拥挤度 vs 当日收益",
+            labels={
+                "crowding_z20": "成交拥挤度 z-score",
+                "avg_return": "平均涨跌幅（%）",
+                "turnover_100m": "成交额（亿元）",
+                "signal_label": "信号标签",
+            },
+        )
+        fig.add_vline(x=2, line_dash="dash", line_color="#b45309")
+        fig.add_hline(y=0, line_dash="dash", line_color="#6b7280")
+        st.plotly_chart(style_plotly(fig), use_container_width=True)
+
+    st.subheader("行业基础透视表")
     display_industry_df = industry_df.rename(
         columns={
             "industry_label": "行业",
