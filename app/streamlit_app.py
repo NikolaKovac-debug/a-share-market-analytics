@@ -309,6 +309,43 @@ def load_quality_report(con):
     ).df()
 
 
+def build_freshness_summary(df):
+    if df.empty or "trade_date" not in df.columns:
+        return {}
+    trade_dates = pd.to_datetime(df["trade_date"], errors="coerce").dropna()
+    if trade_dates.empty:
+        return {}
+
+    latest_date = trade_dates.max().date()
+    earliest_date = trade_dates.min().date()
+    today = pd.Timestamp.today().date()
+    return {
+        "latest_date": latest_date,
+        "earliest_date": earliest_date,
+        "calendar_lag_days": (today - latest_date).days,
+        "trade_date_count": trade_dates.dt.normalize().nunique(),
+        "calendar_span_days": (latest_date - earliest_date).days + 1,
+    }
+
+
+def get_selected_benchmark_return(index_df, selected_date):
+    if index_df.empty:
+        return float("nan"), None
+
+    selected_index_df = index_df[index_df["trade_date"].dt.date == selected_date].copy()
+    if selected_index_df.empty:
+        return float("nan"), None
+
+    preferred_order = ["沪深300", "中证500"]
+    for index_name in preferred_order:
+        matched = selected_index_df[selected_index_df["index_name"] == index_name]
+        if not matched.empty:
+            return matched["pct_chg"].iloc[0], index_name
+
+    first_row = selected_index_df.iloc[0]
+    return first_row["pct_chg"], first_row["index_name"]
+
+
 def clean_market_data(df):
     cleaned = df.copy()
     cleaned["trade_date"] = pd.to_datetime(cleaned["trade_date"], errors="coerce")
@@ -461,6 +498,7 @@ index_df = load_index_data(con)
 quality_report_df = load_quality_report(con)
 if quality_report_df.empty and not market_df.empty:
     quality_report_df = build_quality_report(market_df, source_table, ["ts_code", "trade_date"])
+freshness_summary = build_freshness_summary(market_df)
 
 with st.sidebar:
     st.subheader("筛选条件")
@@ -527,6 +565,11 @@ industry_df = (
     )
     .sort_values("turnover_100m", ascending=False)
 )
+benchmark_return, benchmark_name = get_selected_benchmark_return(index_df, selected_date)
+if pd.notna(benchmark_return):
+    industry_df["relative_benchmark_return"] = industry_df["avg_return"] - benchmark_return
+else:
+    industry_df["relative_benchmark_return"] = pd.NA
 
 trend_df = (
     filtered_base_df.groupby("trade_date", as_index=False)
@@ -866,14 +909,16 @@ with tab_risk:
     st.subheader("风险监控与异常识别")
     st.caption("基于滚动 20 日窗口识别异常涨跌幅、成交放量、高波动和深度回撤股票。")
 
-    risk_cols = st.columns(4)
+    risk_cols = st.columns(5)
     with risk_cols[0]:
         render_metric("风险预警股票", f"{len(risk_alert_df):,}", "任一风控标记触发")
     with risk_cols[1]:
-        render_metric("异常涨跌幅", f"{int(risk_today_df['abnormal_return_flag'].sum()):,}", "|return z-score| >= 2")
+        render_metric("高风险", f"{int((risk_today_df['risk_level'] == '高风险').sum()):,}", "多规则或深回撤触发")
     with risk_cols[2]:
-        render_metric("异常放量", f"{int(risk_today_df['abnormal_turnover_flag'].sum()):,}", "turnover z-score >= 2")
+        render_metric("警示", f"{int((risk_today_df['risk_level'] == '警示').sum()):,}", "至少两类风险触发")
     with risk_cols[3]:
+        render_metric("观察", f"{int((risk_today_df['risk_level'] == '观察').sum()):,}", "单一风险规则触发")
+    with risk_cols[4]:
         render_metric("深度回撤", f"{int(risk_today_df['deep_drawdown_flag'].sum()):,}", "20 日回撤 <= -20%")
 
     risk_rank_df = risk_today_df.sort_values(
@@ -892,6 +937,8 @@ with tab_risk:
             "turnover_zscore_20d",
             "drawdown_20d",
             "consecutive_down_days",
+            "risk_trigger_count",
+            "risk_level",
             "high_risk_flag",
             "risk_reason",
         ]
@@ -907,6 +954,8 @@ with tab_risk:
             "turnover_zscore_20d": "成交额z值",
             "drawdown_20d": "20日回撤",
             "consecutive_down_days": "连续下跌天数",
+            "risk_trigger_count": "触发数量",
+            "risk_level": "风险等级",
             "high_risk_flag": "风险标记",
             "risk_reason": "触发原因",
         }
@@ -1228,6 +1277,17 @@ with tab_quality:
     st.subheader("数据质量监控")
     st.caption("展示抽取后生成的表级数据质量指标，包括行数、日期范围、缺失率和主键重复情况。")
 
+    if freshness_summary:
+        freshness_cols = st.columns(4)
+        with freshness_cols[0]:
+            render_metric("最新交易日", str(freshness_summary["latest_date"]), "当前数据库最大交易日")
+        with freshness_cols[1]:
+            render_metric("距今天数", f"{freshness_summary['calendar_lag_days']} 天", "按自然日计算")
+        with freshness_cols[2]:
+            render_metric("覆盖交易日", f"{freshness_summary['trade_date_count']:,}", "数据库内交易日期数量")
+        with freshness_cols[3]:
+            render_metric("样本跨度", f"{freshness_summary['calendar_span_days']:,} 天", "最早至最新交易日")
+
     if quality_report_df.empty:
         st.info("暂无数据质量报告。运行 `py -m src.extract` 后会生成 data_quality_report 表。")
     else:
@@ -1289,6 +1349,10 @@ with tab_report:
 with tab_industry:
     st.subheader("行业轮动与拥挤度信号")
     st.caption("用行业成交额 20 日 z-score 衡量交易拥挤度，并结合行业平均收益和上涨占比给出状态标签。")
+    if benchmark_name:
+        st.caption(f"当前相对收益基准：{benchmark_name}，当日涨跌幅 {benchmark_return:.2f}%")
+    else:
+        st.caption("指数基准数据不可用，行业相对基准收益暂不展示。")
 
     if not industry_signal_df.empty:
         industry_signal_display_df = industry_signal_df[
@@ -1314,17 +1378,19 @@ with tab_industry:
                 "signal_label": "信号标签",
             }
         )
+        if pd.notna(benchmark_return):
+            industry_signal_display_df["相对基准收益"] = industry_signal_display_df["平均涨跌幅"] - benchmark_return
+        industry_signal_format = {
+            "成交额_亿元": "{:,.2f}",
+            "平均涨跌幅": "{:.2f}",
+            "上涨占比": "{:.1%}",
+            "拥挤度z值": "{:.2f}",
+            "相对20日收益": "{:.2f}",
+        }
+        if "相对基准收益" in industry_signal_display_df.columns:
+            industry_signal_format["相对基准收益"] = "{:.2f}"
         st.dataframe(
-            industry_signal_display_df.style.format(
-                {
-                    "成交额_亿元": "{:,.2f}",
-                    "平均涨跌幅": "{:.2f}",
-                    "上涨占比": "{:.1%}",
-                    "拥挤度z值": "{:.2f}",
-                    "相对20日收益": "{:.2f}",
-                },
-                na_rep="-",
-            ),
+            industry_signal_display_df.style.format(industry_signal_format, na_rep="-"),
             use_container_width=True,
             hide_index=True,
         )
@@ -1358,18 +1424,19 @@ with tab_industry:
             "up_ratio": "上涨占比",
             "limit_up_count": "涨停代理数",
             "net_flow_100m": "资金净流入_亿元",
+            "relative_benchmark_return": "相对基准收益",
         }
     )
+    display_industry_format = {
+        "成交额_亿元": "{:,.2f}",
+        "平均涨跌幅": "{:.2f}",
+        "上涨占比": "{:.1%}",
+        "资金净流入_亿元": "{:,.2f}",
+    }
+    if "相对基准收益" in display_industry_df.columns:
+        display_industry_format["相对基准收益"] = "{:.2f}"
     st.dataframe(
-        display_industry_df.style.format(
-            {
-                "成交额_亿元": "{:,.2f}",
-                "平均涨跌幅": "{:.2f}",
-                "上涨占比": "{:.1%}",
-                "资金净流入_亿元": "{:,.2f}",
-            },
-            na_rep="-",
-        ),
+        display_industry_df.style.format(display_industry_format, na_rep="-"),
         use_container_width=True,
         hide_index=True,
     )

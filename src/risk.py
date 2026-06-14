@@ -41,5 +41,31 @@ def build_stock_risk_features(market_df: pd.DataFrame) -> pd.DataFrame:
         | df["high_volatility_flag"]
         | df["deep_drawdown_flag"]
     )
+    df["risk_trigger_count"] = (
+        df[
+            [
+                "abnormal_return_flag",
+                "abnormal_turnover_flag",
+                "high_volatility_flag",
+                "deep_drawdown_flag",
+            ]
+        ]
+        .fillna(False)
+        .sum(axis=1)
+    )
+    df["risk_level"] = df.apply(_classify_risk_level, axis=1)
     return df
 
+
+def _classify_risk_level(row) -> str:
+    if row.get("risk_trigger_count", 0) >= 3:
+        return "高风险"
+    if row.get("drawdown_20d", 0) <= -30:
+        return "高风险"
+    if abs(row.get("return_zscore_20d", 0)) >= 3:
+        return "高风险"
+    if row.get("risk_trigger_count", 0) >= 2:
+        return "警示"
+    if bool(row.get("high_risk_flag", False)):
+        return "观察"
+    return "正常"

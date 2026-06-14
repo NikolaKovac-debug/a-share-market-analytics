@@ -25,6 +25,8 @@ class RiskTests(unittest.TestCase):
             "turnover_zscore_20d",
             "drawdown_20d",
             "consecutive_down_days",
+            "risk_trigger_count",
+            "risk_level",
             "high_risk_flag",
         ]
         for column in expected_columns:
