@@ -25,6 +25,7 @@ from src.research import (
     estimate_ar1_half_life,
     regime_interpretation,
 )
+from src.quality import build_quality_report
 from src.risk import build_stock_risk_features
 
 
@@ -458,6 +459,8 @@ source_table, source_label = choose_source_table(con)
 market_df = clean_market_data(load_market_data(con, source_table))
 index_df = load_index_data(con)
 quality_report_df = load_quality_report(con)
+if quality_report_df.empty and not market_df.empty:
+    quality_report_df = build_quality_report(market_df, source_table, ["ts_code", "trade_date"])
 
 with st.sidebar:
     st.subheader("筛选条件")
