@@ -753,15 +753,6 @@ with tab_overview:
     )
     st.plotly_chart(style_plotly(fig), use_container_width=True)
 
-    st.markdown(
-        """
-        **分析框架**
-
-        本页不是替代东方财富这类数据中心，而是把行情加工成可解释信号：
-        市场温度用于判断风险偏好，行业拥挤度用于观察交易是否集中，风险监控用于定位异常样本。
-        """
-    )
-
     with st.expander("查看市场温度评分标准"):
         st.markdown(
             """
