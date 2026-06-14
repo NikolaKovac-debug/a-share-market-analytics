@@ -328,6 +328,43 @@ def build_freshness_summary(df):
     }
 
 
+def ensure_risk_level_columns(df):
+    result = df.copy()
+    trigger_columns = [
+        "abnormal_return_flag",
+        "abnormal_turnover_flag",
+        "high_volatility_flag",
+        "deep_drawdown_flag",
+    ]
+    for column in trigger_columns:
+        if column not in result.columns:
+            result[column] = False
+
+    if "risk_trigger_count" not in result.columns:
+        result["risk_trigger_count"] = result[trigger_columns].fillna(False).sum(axis=1)
+
+    if "risk_level" not in result.columns:
+        drawdown = pd.to_numeric(
+            result["drawdown_20d"] if "drawdown_20d" in result.columns else pd.Series(pd.NA, index=result.index),
+            errors="coerce",
+        )
+        return_zscore = pd.to_numeric(
+            result["return_zscore_20d"] if "return_zscore_20d" in result.columns else pd.Series(pd.NA, index=result.index),
+            errors="coerce",
+        )
+        result["risk_level"] = "正常"
+        result.loc[result["high_risk_flag"].fillna(False), "risk_level"] = "观察"
+        result.loc[result["risk_trigger_count"] >= 2, "risk_level"] = "警示"
+        result.loc[
+            (result["risk_trigger_count"] >= 3)
+            | (drawdown <= -30)
+            | (return_zscore.abs() >= 3),
+            "risk_level",
+        ] = "高风险"
+
+    return result
+
+
 def get_selected_benchmark_return(index_df, selected_date):
     if index_df.empty:
         return float("nan"), None
@@ -596,6 +633,7 @@ latest_up_ratio_z = latest_trend["up_ratio_z20"].iloc[0] if not latest_trend.emp
 up_ratio_half_life = estimate_ar1_half_life(trend_df["up_ratio"])
 risk_feature_df = build_stock_risk_features(filtered_base_df)
 risk_today_df = risk_feature_df[risk_feature_df["trade_date"].dt.date == selected_date].copy()
+risk_today_df = ensure_risk_level_columns(risk_today_df)
 risk_today_df["risk_reason"] = risk_today_df.apply(build_risk_reason, axis=1)
 risk_alert_df = risk_today_df[risk_today_df["high_risk_flag"]].copy()
 risk_ratio = len(risk_alert_df) / len(risk_today_df) if len(risk_today_df) else float("nan")
