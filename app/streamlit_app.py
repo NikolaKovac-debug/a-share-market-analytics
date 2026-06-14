@@ -350,44 +350,62 @@ def classify_market_regime(score, risk_ratio):
         return "样本不足"
     if pd.isna(risk_ratio):
         risk_ratio = 0.2
-    if risk_ratio >= 0.35 and score >= 65:
+    if risk_ratio >= 0.35 and score >= 60:
         return "过热高波动"
-    if risk_ratio >= 0.35 and score < 50:
+    if risk_ratio >= 0.35 and score >= 45:
+        return "高风险分化"
+    if risk_ratio >= 0.35:
         return "风险释放"
-    if score >= 70:
-        return "Risk-on 扩张"
-    if score <= 35:
-        return "Risk-off 收缩"
-    return "结构分化"
+    if score >= 80:
+        return "过热扩张"
+    if score >= 65:
+        return "Risk-on 偏强"
+    if score >= 55:
+        return "偏暖轮动"
+    if score >= 45:
+        return "结构分化"
+    if score >= 35:
+        return "偏弱震荡"
+    return "Risk-off 收缩"
 
 
 def regime_interpretation(regime):
     mapping = {
-        "Risk-on 扩张": "上涨扩散、成交活跃，适合观察强势行业能否持续扩散。",
+        "过热扩张": "市场温度处于高位，成交和宽度共同抬升，需要同时观察持续性与过热风险。",
+        "Risk-on 偏强": "风险偏好偏强，上涨扩散或成交活跃度较好，适合观察强势行业能否延续。",
+        "偏暖轮动": "市场略偏暖，但尚未进入单边扩张，行业轮动和结构性机会更重要。",
+        "结构分化": "市场处于中性区间，没有明确单边状态，行业轮动和个股分化是主要观察对象。",
+        "偏弱震荡": "市场温度偏低但未进入明显风险释放，适合观察成交萎缩和弱势行业扩散。",
         "Risk-off 收缩": "市场宽度和成交活跃度偏弱，风险偏好处于收缩区间。",
         "过热高波动": "赚钱效应较强但风险样本偏多，可能存在交易拥挤或短期过热。",
+        "高风险分化": "风险样本占比较高，但市场温度未明显转弱，说明内部波动和结构分歧较强。",
         "风险释放": "风险股票占比较高且市场温度不足，适合重点监控回撤与流动性压力。",
-        "结构分化": "市场没有单边状态，行业轮动和个股分化是主要观察对象。",
         "样本不足": "当前滚动窗口不足，暂不做稳定状态判断。",
     }
     return mapping.get(regime, "市场状态需要结合成交、宽度和风险指标共同观察。")
 
 
-def build_market_score(trend_row, risk_ratio):
+def build_market_score_detail(trend_row, risk_ratio):
     turnover_score = z_to_score(trend_row.get("turnover_100m_z20", float("nan")))
     return_score = z_to_score(trend_row.get("avg_return_z20", float("nan")))
     breadth_score = z_to_score(trend_row.get("up_ratio_z20", float("nan")))
     limit_up_score = clamp(trend_row.get("limit_up_count", 0) / max(trend_row.get("stock_count", 1), 1) * 1000)
     if pd.isna(risk_ratio):
         risk_ratio = 0.2
-    risk_penalty = clamp(risk_ratio * 100)
-    score = (
-        0.30 * turnover_score
-        + 0.25 * return_score
-        + 0.25 * breadth_score
-        + 0.10 * limit_up_score
-        + 0.10 * (100 - risk_penalty)
-    )
+    risk_control_score = 100 - clamp(risk_ratio * 100)
+    components = [
+        {"指标": "成交活跃度", "权重": 0.30, "分项得分": turnover_score, "解释": "成交额相对20日均值的z-score"},
+        {"指标": "收益强度", "权重": 0.25, "分项得分": return_score, "解释": "等权平均涨跌幅相对20日均值的z-score"},
+        {"指标": "市场宽度", "权重": 0.25, "分项得分": breadth_score, "解释": "上涨占比相对20日均值的z-score"},
+        {"指标": "涨停热度", "权重": 0.10, "分项得分": limit_up_score, "解释": "涨停代理数量 / 股票数量"},
+        {"指标": "风险惩罚", "权重": 0.10, "分项得分": risk_control_score, "解释": "风险样本占比越高，该项得分越低"},
+    ]
+    score = sum(item["权重"] * item["分项得分"] for item in components)
+    return clamp(score), components
+
+
+def build_market_score(trend_row, risk_ratio):
+    score, _ = build_market_score_detail(trend_row, risk_ratio)
     return clamp(score)
 
 
@@ -623,7 +641,7 @@ risk_today_df["risk_reason"] = risk_today_df.apply(build_risk_reason, axis=1)
 risk_alert_df = risk_today_df[risk_today_df["high_risk_flag"]].copy()
 risk_ratio = len(risk_alert_df) / len(risk_today_df) if len(risk_today_df) else float("nan")
 latest_trend_row = latest_trend.iloc[0].to_dict() if not latest_trend.empty else {}
-market_heat_score = build_market_score(latest_trend_row, risk_ratio)
+market_heat_score, market_score_components = build_market_score_detail(latest_trend_row, risk_ratio)
 market_regime = classify_market_regime(market_heat_score, risk_ratio)
 market_regime_note = regime_interpretation(market_regime)
 industry_signal_df = build_industry_signal_frame(filtered_base_df, filtered_df)
@@ -704,6 +722,28 @@ with tab_overview:
         市场温度用于判断风险偏好，行业拥挤度用于观察交易是否集中，风险监控用于定位异常样本。
         """
     )
+
+    with st.expander("查看市场温度评分标准"):
+        st.markdown(
+            """
+            **评分口径**
+
+            - `成交活跃度`：成交额相对过去 20 日的 z-score，权重 30%。
+            - `收益强度`：等权平均涨跌幅相对过去 20 日的 z-score，权重 25%。
+            - `市场宽度`：上涨占比相对过去 20 日的 z-score，权重 25%。
+            - `涨停热度`：涨停代理数量占比，权重 10%。
+            - `风险惩罚`：风险预警股票占比越高，该项得分越低，权重 10%。
+
+            单个 z-score 分项会先转换为 `50 + 15 * z`，再限制在 0 到 100 之间。
+            """
+        )
+        component_df = pd.DataFrame(market_score_components)
+        component_df["权重"] = component_df["权重"].map(lambda value: f"{value:.0%}")
+        st.dataframe(
+            component_df.style.format({"分项得分": "{:.1f}"}),
+            use_container_width=True,
+            hide_index=True,
+        )
 
 with tab_trend:
     col1, col2 = st.columns(2)
@@ -854,6 +894,20 @@ with tab_research:
         - `z-score < -2` 通常表示指标显著低于近期均值，可能代表成交低迷或风险偏好收缩。
         - 半衰期来自一个简化 AR(1) 估计，用来描述上涨占比偏离均值后回归正常状态的大致速度。
         - 这些指标不是交易信号本身，更适合作为市场状态监控和研究解释变量。
+        """
+    )
+
+    st.markdown(
+        """
+        **状态分层**
+
+        - `80-100`：过热扩张。
+        - `65-80`：Risk-on 偏强。
+        - `55-65`：偏暖轮动。
+        - `45-55`：结构分化。
+        - `35-45`：偏弱震荡。
+        - `0-35`：Risk-off 收缩。
+        - 若风险样本占比超过 35%，会优先识别为 `过热高波动`、`高风险分化` 或 `风险释放`。
         """
     )
 
