@@ -1,4 +1,5 @@
 from pathlib import Path
+import gc
 import os
 import subprocess
 import sys
@@ -72,13 +73,17 @@ def get_connection():
 
 
 def close_cached_connection():
+    con = None
     try:
         con = get_connection()
         con.close()
     except Exception:
         pass
+    finally:
+        del con
 
     st.cache_resource.clear()
+    gc.collect()
 
 
 def table_exists(con, table_name):
@@ -388,7 +393,7 @@ if st.button("拉取 / 更新真实数据", type="primary"):
         with st.spinner("正在云端拉取 Tushare 数据并生成 DuckDB，请稍等..."):
             log_text = run_cloud_extract(days=int(update_days))
 
-        st.cache_resource.clear()
+        close_cached_connection()
         st.success("真实数据更新完成，正在刷新页面。")
 
         with st.expander("查看抽取日志"):
