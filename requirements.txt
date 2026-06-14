@@ -1,6 +1,7 @@
 duckdb
 pandas
 plotly
+pyarrow
 python-dotenv
 streamlit
 tushare

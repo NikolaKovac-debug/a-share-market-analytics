@@ -8,7 +8,11 @@ data/database/*.duckdb
 data/database/*.duckdb.wal
 data/database/*.wal
 data/raw/*.csv
+data/raw/*.parquet
 data/processed/*.csv
+data/processed/*.parquet
+data/snapshots/*.duckdb
+data/snapshots/*.duckdb.wal
 
 # Local notebooks / reports generated during exploration
 reports/figures/

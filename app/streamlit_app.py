@@ -13,7 +13,18 @@ import plotly.express as px
 import streamlit as st
 
 from src.config import DB_PATH
-from src.research import add_rolling_zscore, classify_zscore, estimate_ar1_half_life
+from src.research import (
+    add_market_score_columns,
+    add_rolling_zscore,
+    build_industry_signal_frame,
+    build_market_score_detail,
+    build_market_score_backtest,
+    build_risk_reason,
+    classify_market_regime,
+    classify_zscore,
+    estimate_ar1_half_life,
+    regime_interpretation,
+)
 from src.risk import build_stock_risk_features
 
 
@@ -260,6 +271,43 @@ def load_market_data(con, table_name):
     ).df()
 
 
+def load_index_data(con):
+    if not table_exists(con, "analytics_index_daily"):
+        return pd.DataFrame()
+    df = con.execute(
+        """
+        select
+            ts_code,
+            index_name,
+            trade_date,
+            close,
+            pct_chg,
+            amount_100m
+        from analytics_index_daily
+        order by trade_date
+        """
+    ).df()
+    df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
+    return df
+
+
+def load_quality_report(con):
+    if not table_exists(con, "data_quality_report"):
+        return pd.DataFrame()
+    return con.execute(
+        """
+        select
+            generated_at,
+            table_name,
+            metric,
+            value,
+            detail
+        from data_quality_report
+        order by generated_at desc, table_name, metric
+        """
+    ).df()
+
+
 def clean_market_data(df):
     cleaned = df.copy()
     cleaned["trade_date"] = pd.to_datetime(cleaned["trade_date"], errors="coerce")
@@ -331,182 +379,6 @@ def localize_sql_result(df):
 
 def dataframe_to_csv_bytes(df):
     return df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-
-
-def clamp(value, lower=0, upper=100):
-    if pd.isna(value):
-        return float("nan")
-    return max(lower, min(upper, float(value)))
-
-
-def z_to_score(z_value, neutral=50, scale=15):
-    if pd.isna(z_value):
-        return neutral
-    return clamp(neutral + float(z_value) * scale)
-
-
-def percentile_score(series):
-    numeric = pd.to_numeric(series, errors="coerce")
-    if numeric.notna().sum() < 5 or numeric.nunique(dropna=True) <= 1:
-        return pd.Series(50.0, index=series.index)
-    return numeric.rank(pct=True) * 100
-
-
-def classify_market_regime(score, risk_ratio):
-    if pd.isna(score):
-        return "样本不足"
-    if pd.isna(risk_ratio):
-        risk_ratio = 0.2
-    if risk_ratio >= 0.35 and score >= 60:
-        return "过热高波动"
-    if risk_ratio >= 0.35 and score >= 45:
-        return "高风险分化"
-    if risk_ratio >= 0.35:
-        return "风险释放"
-    if score >= 80:
-        return "过热扩张"
-    if score >= 65:
-        return "Risk-on 偏强"
-    if score >= 55:
-        return "偏暖轮动"
-    if score >= 45:
-        return "结构分化"
-    if score >= 35:
-        return "偏弱震荡"
-    return "Risk-off 收缩"
-
-
-def regime_interpretation(regime):
-    mapping = {
-        "过热扩张": "市场温度处于高位，成交和宽度共同抬升，需要同时观察持续性与过热风险。",
-        "Risk-on 偏强": "风险偏好偏强，上涨扩散或成交活跃度较好，适合观察强势行业能否延续。",
-        "偏暖轮动": "市场略偏暖，但尚未进入单边扩张，行业轮动和结构性机会更重要。",
-        "结构分化": "市场处于中性区间，没有明确单边状态，行业轮动和个股分化是主要观察对象。",
-        "偏弱震荡": "市场温度偏低但未进入明显风险释放，适合观察成交萎缩和弱势行业扩散。",
-        "Risk-off 收缩": "市场宽度和成交活跃度偏弱，风险偏好处于收缩区间。",
-        "过热高波动": "赚钱效应较强但风险样本偏多，可能存在交易拥挤或短期过热。",
-        "高风险分化": "风险样本占比较高，但市场温度未明显转弱，说明内部波动和结构分歧较强。",
-        "风险释放": "风险股票占比较高且市场温度不足，适合重点监控回撤与流动性压力。",
-        "样本不足": "当前滚动窗口不足，暂不做稳定状态判断。",
-    }
-    return mapping.get(regime, "市场状态需要结合成交、宽度和风险指标共同观察。")
-
-
-def add_market_score_columns(df):
-    result = df.copy()
-    result["limit_up_intensity"] = result["limit_up_count"] / result["stock_count"].replace(0, pd.NA)
-    result["risk_ratio"] = pd.to_numeric(result["risk_ratio"], errors="coerce").fillna(0.2)
-
-    result["turnover_score"] = percentile_score(result["turnover_100m"])
-    result["return_score"] = percentile_score(result["avg_return"])
-    result["breadth_score"] = percentile_score(result["up_ratio"])
-    result["limit_up_score"] = percentile_score(result["limit_up_intensity"])
-    result["risk_control_score"] = 100 - percentile_score(result["risk_ratio"])
-
-    result["market_heat_score"] = (
-        0.25 * result["turnover_score"]
-        + 0.25 * result["breadth_score"]
-        + 0.20 * result["return_score"]
-        + 0.15 * result["limit_up_score"]
-        + 0.15 * result["risk_control_score"]
-    ).clip(0, 100)
-    return result
-
-
-def build_market_score_detail(trend_row, risk_ratio):
-    if "turnover_score" in trend_row:
-        turnover_score = trend_row.get("turnover_score", float("nan"))
-        return_score = trend_row.get("return_score", float("nan"))
-        breadth_score = trend_row.get("breadth_score", float("nan"))
-        limit_up_score = trend_row.get("limit_up_score", float("nan"))
-        risk_control_score = trend_row.get("risk_control_score", float("nan"))
-        explanation_suffix = "基于当前样本期历史分位数"
-    else:
-        turnover_score = z_to_score(trend_row.get("turnover_100m_z20", float("nan")))
-        return_score = z_to_score(trend_row.get("avg_return_z20", float("nan")))
-        breadth_score = z_to_score(trend_row.get("up_ratio_z20", float("nan")))
-        limit_up_score = clamp(trend_row.get("limit_up_count", 0) / max(trend_row.get("stock_count", 1), 1) * 1000)
-        if pd.isna(risk_ratio):
-            risk_ratio = 0.2
-        risk_control_score = 100 - clamp(risk_ratio * 100)
-        explanation_suffix = "基于20日z-score映射"
-    components = [
-        {"指标": "成交活跃度", "权重": 0.25, "分项得分": turnover_score, "解释": f"成交额强弱，{explanation_suffix}"},
-        {"指标": "市场宽度", "权重": 0.25, "分项得分": breadth_score, "解释": f"上涨占比强弱，{explanation_suffix}"},
-        {"指标": "收益强度", "权重": 0.20, "分项得分": return_score, "解释": f"等权平均涨跌幅强弱，{explanation_suffix}"},
-        {"指标": "涨停热度", "权重": 0.15, "分项得分": limit_up_score, "解释": "涨停代理占比在样本期中的历史位置"},
-        {"指标": "风险控制", "权重": 0.15, "分项得分": risk_control_score, "解释": "风险样本占比越高，该项得分越低"},
-    ]
-    score = sum(item["权重"] * item["分项得分"] for item in components)
-    return clamp(score), components
-
-
-def build_market_score(trend_row, risk_ratio):
-    score, _ = build_market_score_detail(trend_row, risk_ratio)
-    return clamp(score)
-
-
-def describe_industry_signal(row):
-    crowding = row.get("crowding_z20", float("nan"))
-    avg_return_value = row.get("avg_return", float("nan"))
-    up_ratio_value = row.get("up_ratio", float("nan"))
-    if pd.notna(crowding) and crowding >= 2 and avg_return_value > 0:
-        return "高拥挤强势"
-    if pd.notna(crowding) and crowding >= 2 and avg_return_value <= 0:
-        return "放量分歧"
-    if avg_return_value > 1 and up_ratio_value >= 0.6:
-        return "扩散上涨"
-    if avg_return_value < -1 and up_ratio_value <= 0.4:
-        return "弱势扩散"
-    if pd.notna(crowding) and crowding <= -1:
-        return "成交低位"
-    return "中性观察"
-
-
-def build_industry_signal_frame(base_df, current_df):
-    history = (
-        base_df.groupby(["trade_date", "industry_label"], as_index=False)
-        .agg(
-            stock_count=("ts_code", "count"),
-            turnover_100m=("amount_100m", "sum"),
-            avg_return=("pct_chg", "mean"),
-            up_ratio=("is_up", "mean"),
-            net_flow_100m=("net_mf_amount_100m", "sum"),
-        )
-        .sort_values(["industry_label", "trade_date"])
-    )
-    if history.empty:
-        return pd.DataFrame()
-
-    grouped = history.groupby("industry_label", group_keys=False)
-    history["turnover_ma20"] = grouped["turnover_100m"].rolling(20, min_periods=5).mean().reset_index(level=0, drop=True)
-    history["turnover_std20"] = grouped["turnover_100m"].rolling(20, min_periods=5).std().reset_index(level=0, drop=True)
-    history["crowding_z20"] = (history["turnover_100m"] - history["turnover_ma20"]) / history["turnover_std20"]
-    history["return_ma20"] = grouped["avg_return"].rolling(20, min_periods=5).mean().reset_index(level=0, drop=True)
-    history["relative_return_20d"] = history["avg_return"] - history["return_ma20"]
-
-    current_date = current_df["trade_date"].dt.normalize().max()
-    signal_df = history[history["trade_date"].dt.normalize() == current_date].copy()
-    if signal_df.empty:
-        return signal_df
-    signal_df["signal_label"] = signal_df.apply(describe_industry_signal, axis=1)
-    signal_df["crowding_score"] = signal_df["crowding_z20"].apply(lambda value: z_to_score(value))
-    return signal_df.sort_values(["crowding_z20", "turnover_100m"], ascending=[False, False])
-
-
-def build_risk_reason(row):
-    reasons = []
-    if bool(row.get("abnormal_return_flag", False)):
-        reasons.append(f"涨跌幅偏离20日均值，z={row.get('return_zscore_20d', float('nan')):.2f}")
-    if bool(row.get("abnormal_turnover_flag", False)):
-        reasons.append(f"成交额显著放大，z={row.get('turnover_zscore_20d', float('nan')):.2f}")
-    if bool(row.get("high_volatility_flag", False)):
-        reasons.append(f"20日波动率较高，vol={row.get('return_vol_20d', float('nan')):.2f}")
-    if bool(row.get("deep_drawdown_flag", False)):
-        reasons.append(f"20日回撤较深，drawdown={row.get('drawdown_20d', float('nan')):.2f}%")
-    if row.get("consecutive_down_days", 0) >= 3:
-        reasons.append(f"连续下跌{int(row.get('consecutive_down_days', 0))}天")
-    return "；".join(reasons) if reasons else "未触发核心风控规则"
 
 
 st.set_page_config(page_title="A股市场结构分析终端", layout="wide")
@@ -584,6 +456,8 @@ if st.button("拉取 / 更新真实数据", type="primary"):
 con = get_connection()
 source_table, source_label = choose_source_table(con)
 market_df = clean_market_data(load_market_data(con, source_table))
+index_df = load_index_data(con)
+quality_report_df = load_quality_report(con)
 
 with st.sidebar:
     st.subheader("筛选条件")
@@ -691,6 +565,7 @@ trend_signal_df["market_regime"] = trend_signal_df.apply(
     lambda row: classify_market_regime(row["market_heat_score"], row.get("risk_ratio", float("nan"))),
     axis=1,
 )
+market_score_backtest_df = build_market_score_backtest(trend_signal_df)
 selected_trend_signal = trend_signal_df[trend_signal_df["trade_date"].dt.date == selected_date].tail(1)
 if selected_trend_signal.empty:
     selected_trend_signal = trend_signal_df.dropna(subset=["trade_date"]).tail(1)
@@ -700,8 +575,8 @@ market_regime = classify_market_regime(market_heat_score, risk_ratio)
 market_regime_note = regime_interpretation(market_regime)
 industry_signal_df = build_industry_signal_frame(filtered_base_df, filtered_df)
 
-tab_overview, tab_trend, tab_research, tab_risk, tab_sql, tab_report, tab_industry, tab_movers, tab_detail = st.tabs(
-    ["市场总览", "半年趋势", "市场状态研究", "风险监控", "SQL样例", "研究报告", "行业透视", "涨跌幅榜", "个股明细"]
+tab_overview, tab_trend, tab_research, tab_risk, tab_sql, tab_quality, tab_report, tab_industry, tab_movers, tab_detail = st.tabs(
+    ["市场总览", "半年趋势", "市场状态研究", "风险监控", "SQL样例", "数据质量", "研究报告", "行业透视", "涨跌幅榜", "个股明细"]
 )
 
 with tab_overview:
@@ -841,6 +716,21 @@ with tab_trend:
     fig.add_hline(y=35, line_dash="dash", line_color="#1f4e79")
     st.plotly_chart(style_plotly(fig), use_container_width=True)
 
+    if not index_df.empty:
+        index_window_df = index_df[index_df["trade_date"].dt.date.isin(trend_df["trade_date"].dt.date)].copy()
+        if not index_window_df.empty:
+            fig = px.line(
+                index_window_df,
+                x="trade_date",
+                y="pct_chg",
+                color="index_name",
+                title="指数基准日涨跌幅",
+                labels={"trade_date": "交易日期", "pct_chg": "日涨跌幅（%）", "index_name": "指数"},
+            )
+            st.plotly_chart(style_plotly(fig), use_container_width=True)
+    else:
+        st.caption("指数基准数据为可选数据；如需展示沪深300/中证500，请运行包含 index_daily 权限的数据抽取。")
+
 with tab_research:
     st.subheader("均值回归与市场状态识别")
     st.caption(
@@ -940,6 +830,34 @@ with tab_research:
         - 若风险样本占比超过 35%，会优先识别为 `过热高波动`、`高风险分化` 或 `风险释放`。
         """
     )
+
+    st.subheader("市场温度分组验证")
+    st.caption("按历史市场温度评分分组，观察各组下一交易日的等权平均涨跌幅和上涨占比。")
+    if market_score_backtest_df.empty:
+        st.info("当前样本不足，暂无法生成分组验证结果。")
+    else:
+        backtest_display_df = market_score_backtest_df.rename(
+            columns={
+                "bucket": "分组",
+                "sample_count": "样本数",
+                "score_min": "评分下限",
+                "score_max": "评分上限",
+                "avg_next_return": "下一日平均涨跌幅",
+                "avg_next_up_ratio": "下一日上涨占比",
+            }
+        )
+        st.dataframe(
+            backtest_display_df.style.format(
+                {
+                    "评分下限": "{:.1f}",
+                    "评分上限": "{:.1f}",
+                    "下一日平均涨跌幅": "{:.2f}",
+                    "下一日上涨占比": "{:.1%}",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
 
 with tab_risk:
     st.subheader("风险监控与异常识别")
@@ -1302,6 +1220,36 @@ limit 50;
         if table_exists(con, ANALYTICS_TABLE):
             schema_df = con.execute(f"describe {ANALYTICS_TABLE}").df()
             st.dataframe(schema_df, use_container_width=True, hide_index=True)
+
+with tab_quality:
+    st.subheader("数据质量监控")
+    st.caption("展示抽取后生成的表级数据质量指标，包括行数、日期范围、缺失率和主键重复情况。")
+
+    if quality_report_df.empty:
+        st.info("暂无数据质量报告。运行 `py -m src.extract` 后会生成 data_quality_report 表。")
+    else:
+        latest_quality_time = quality_report_df["generated_at"].max()
+        latest_quality_df = quality_report_df[quality_report_df["generated_at"] == latest_quality_time].copy()
+        st.caption(f"最近生成时间：{latest_quality_time}")
+        st.dataframe(
+            latest_quality_df.rename(
+                columns={
+                    "generated_at": "生成时间",
+                    "table_name": "表名",
+                    "metric": "指标",
+                    "value": "数值",
+                    "detail": "说明",
+                }
+            ).style.format({"数值": "{:.4f}"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.download_button(
+            "下载数据质量报告 CSV",
+            data=dataframe_to_csv_bytes(latest_quality_df),
+            file_name=f"data_quality_report_{selected_date}.csv",
+            mime="text/csv",
+        )
 
 with tab_report:
     st.subheader("自动研究报告")

@@ -7,9 +7,10 @@
 - 自动拉取最近约半年 A 股行情数据，默认滚动窗口为 180 天。
 - 支持 sample data 模式，无 Tushare token 也可生成示例数据库。
 - 使用 DuckDB 构建本地分析型数据库，核心宽表为 `analytics_market_daily`。
-- Streamlit dashboard 覆盖市场总览、半年趋势、市场状态研究、风险监控、SQL 样例、研究报告、行业透视、涨跌幅榜和个股明细。
+- Streamlit dashboard 覆盖市场总览、半年趋势、市场状态研究、风险监控、SQL 样例、数据质量、研究报告、行业透视、涨跌幅榜和个股明细。
 - 内置 SQL 编辑器，可直接运行 `SELECT / WITH` 查询。
 - 使用 SQL 窗口函数和 Python 滚动统计构建市场状态、行业拥挤度和风险监控指标。
+- 支持 raw/processed Parquet 中间层、数据质量报告和 DuckDB 快照。
 - 支持风险预警表、行业透视表和研究报告下载。
 
 ## 项目架构
@@ -25,7 +26,7 @@ flowchart LR
     F --> H["市场状态研究"]
     F --> I["风险监控"]
     F --> J["SQL 编辑器"]
-    F --> K["研究报告"]
+    F --> K["数据质量 / 研究报告"]
 ```
 
 ## 页面截图
@@ -52,6 +53,7 @@ docs/images/sql_examples.png
 - `daily`：股票日行情
 - `moneyflow`：资金流数据，可选
 - `limit_list_d`：涨跌停数据，可选
+- `index_daily`：指数行情数据，可选，当前用于沪深300和中证500基准展示
 
 Tushare token 通过本地 `.env` 或 Streamlit Secrets 配置，不应提交到代码仓库。
 
@@ -66,8 +68,9 @@ Tushare token 通过本地 `.env` 或 Streamlit Secrets 配置，不应提交到
 
 - `moneyflow`
 - `limit_list_d`
+- `index_daily`
 
-如果增强接口不可用，抽取脚本会跳过对应数据，不影响行情、行业结构、趋势分析、风险监控和 SQL 查询功能。资金流、涨跌停相关指标会根据可用数据自动展示或留空。
+如果增强接口不可用，抽取脚本会跳过对应数据，不影响行情、行业结构、趋势分析、风险监控和 SQL 查询功能。资金流、涨跌停、指数基准相关指标会根据可用数据自动展示或留空。
 
 请求频率受限时可调大请求间隔：
 
@@ -102,6 +105,7 @@ src/
   database.py
   extract.py
   probe_tushare.py
+  quality.py
   research.py
   risk.py
   tushare_client.py
@@ -116,6 +120,7 @@ data/
   raw/          # 本地原始数据，已忽略
   processed/    # 本地处理数据，已忽略
   database/     # DuckDB 数据库，已忽略
+  snapshots/    # DuckDB 快照，已忽略
 
 .env.example
 requirements.txt
@@ -180,6 +185,7 @@ python -m streamlit run app\streamlit_app.py
 - 市场状态研究：20 日滚动 z-score、均值回归、AR(1) 半衰期估计、状态分层说明。
 - 风险监控：异常涨跌幅、异常成交放量、高波动、20 日回撤、连续下跌天数、风险触发原因。
 - SQL 样例：内置 SQL 编辑器，包含窗口函数、分组聚合、市场温度和行业拥挤度查询。
+- 数据质量：展示抽取后的行数、日期范围、缺失率、重复键等质量指标。
 - 研究报告：生成市场状态摘要和指标解释。
 - 行业透视：行业成交额、平均涨跌幅、上涨占比、资金流、行业拥挤度和轮动标签。
 - 涨跌幅榜：当日涨幅榜和跌幅榜。
@@ -193,6 +199,17 @@ python -m streamlit run app\streamlit_app.py
 - 行业拥挤度：行业成交额历史分位、成交额 z-score、相对 20 日收益。
 - 风险指标：20 日波动率、20 日回撤、异常涨跌幅、异常放量、连续下跌天数。
 - 研究指标：滚动均值、滚动标准差、z-score、AR(1) 半衰期。
+
+## 数据产物
+
+抽取脚本会生成以下本地数据产物：
+
+- `data/raw/*.csv` 与 `data/raw/*.parquet`：接口原始返回数据。
+- `data/processed/*.parquet`：处理后的宽表和指数基准数据。
+- `data/database/market_analytics.duckdb`：本地 DuckDB 分析库。
+- `data/snapshots/*.duckdb`：抽取完成后的 DuckDB 快照。
+
+上述本地数据文件已通过 `.gitignore` 排除。
 
 ## SQL 示例
 
@@ -261,4 +278,5 @@ py -m unittest discover tests
 - 不要上传 Tushare token。
 - 不要上传本地 DuckDB 数据库文件。
 - 不要上传 `data/raw/` 或 `data/processed/` 中的本地数据。
+- 不要上传 `data/snapshots/` 中的本地数据库快照。
 - `.gitignore` 已默认排除上述敏感或大体积文件。

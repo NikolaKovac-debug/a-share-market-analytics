@@ -7,6 +7,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 RAW_DIR = DATA_DIR / "raw"
 PROCESSED_DIR = DATA_DIR / "processed"
+SNAPSHOT_DIR = DATA_DIR / "snapshots"
 DB_PATH = DATA_DIR / "database" / "market_analytics.duckdb"
 
 

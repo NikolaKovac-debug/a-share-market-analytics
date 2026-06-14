@@ -1,12 +1,14 @@
 import argparse
+import shutil
 import time
 from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
 
-from src.config import RAW_DIR
+from src.config import DB_PATH, PROCESSED_DIR, RAW_DIR, SNAPSHOT_DIR
 from src.database import connect, write_dataframe
+from src.quality import build_quality_report
 from src.tushare_client import TushareClient
 
 
@@ -39,9 +41,16 @@ DEFAULT_DATASETS = {
         "accepts_dates": True,
         "required": False,
     },
+    "index_daily": {
+        "api": "index_daily",
+        "params": {"fields": "ts_code,trade_date,close,pct_chg,vol,amount"},
+        "accepts_dates": True,
+        "required": False,
+    },
 }
 
-DAILY_SLICE_DATASETS = {"daily", "moneyflow", "limit_list_d"}
+DAILY_SLICE_DATASETS = {"daily", "moneyflow", "limit_list_d", "index_daily"}
+BENCHMARK_INDEX_CODES = ["000300.SH", "000905.SH"]
 
 
 NUMERIC_COLUMNS = [
@@ -141,14 +150,34 @@ def run_sample(days: int) -> None:
     write_dataframe(con, "raw_daily", daily_df)
     write_dataframe(con, "raw_moneyflow", moneyflow_df)
     build_market_table(con, stock_basic_df, daily_df, moneyflow_df)
+    con.close()
+    snapshot_database()
     print(f"Built sample analytics_market_daily with {len(daily_df)} rows.")
 
 
-def save_raw_csv(df: pd.DataFrame, dataset_name: str) -> None:
+def save_raw_dataset(df: pd.DataFrame, dataset_name: str) -> None:
     RAW_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = RAW_DIR / f"{dataset_name}_{timestamp}.csv"
-    df.to_csv(output_path, index=False, encoding="utf-8-sig")
+    csv_path = RAW_DIR / f"{dataset_name}_{timestamp}.csv"
+    parquet_path = RAW_DIR / f"{dataset_name}_{timestamp}.parquet"
+    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    df.to_parquet(parquet_path, index=False)
+
+
+def save_processed_dataset(df: pd.DataFrame, dataset_name: str) -> None:
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    parquet_path = PROCESSED_DIR / f"{dataset_name}_{timestamp}.parquet"
+    df.to_parquet(parquet_path, index=False)
+
+
+def snapshot_database() -> None:
+    if not DB_PATH.exists():
+        return
+    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    snapshot_path = SNAPSHOT_DIR / f"market_analytics_{timestamp}.duckdb"
+    shutil.copy2(DB_PATH, snapshot_path)
 
 
 def fetch_by_trade_date(
@@ -187,6 +216,9 @@ def fetch_dataset(
     end_date: str | None,
     pause: float,
 ) -> pd.DataFrame:
+    if dataset_name == "index_daily":
+        return fetch_index_daily(client, start_date, end_date, pause)
+
     dataset = DEFAULT_DATASETS[dataset_name]
     params = dict(dataset["params"])
     if dataset_name in DAILY_SLICE_DATASETS and start_date and end_date:
@@ -198,6 +230,35 @@ def fetch_dataset(
         params["end_date"] = end_date
 
     return client.query(dataset["api"], **params)
+
+
+def fetch_index_daily(
+    client: TushareClient,
+    start_date: str | None,
+    end_date: str | None,
+    pause: float,
+) -> pd.DataFrame:
+    frames = []
+    for ts_code in BENCHMARK_INDEX_CODES:
+        params = dict(DEFAULT_DATASETS["index_daily"]["params"])
+        params["ts_code"] = ts_code
+        if start_date:
+            params["start_date"] = start_date
+        if end_date:
+            params["end_date"] = end_date
+        try:
+            frame = client.query("index_daily", **params)
+        except Exception as exc:
+            print(f"  skipped index_daily {ts_code}: {exc}")
+            continue
+        if not frame.empty:
+            frames.append(frame)
+        if pause > 0:
+            time.sleep(pause)
+
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True).drop_duplicates()
 
 
 def normalize_stock_basic(stock_basic_df: pd.DataFrame) -> pd.DataFrame:
@@ -254,11 +315,32 @@ def normalize_moneyflow(moneyflow_df: pd.DataFrame | None) -> pd.DataFrame | Non
     return df[keep_columns].dropna(subset=["ts_code", "trade_date"])
 
 
+def normalize_index_daily(index_daily_df: pd.DataFrame | None) -> pd.DataFrame | None:
+    if index_daily_df is None or index_daily_df.empty:
+        return None
+    df = index_daily_df.copy()
+    for column in ["ts_code", "trade_date", "close", "pct_chg", "vol", "amount"]:
+        if column not in df.columns:
+            df[column] = pd.NA
+
+    df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
+    for column in ["close", "pct_chg", "vol", "amount"]:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+
+    index_name_map = {"000300.SH": "沪深300", "000905.SH": "中证500"}
+    df["index_name"] = df["ts_code"].map(index_name_map).fillna(df["ts_code"])
+    df["amount_100m"] = df["amount"] / 100000
+    return df[["ts_code", "index_name", "trade_date", "close", "pct_chg", "vol", "amount_100m"]].dropna(
+        subset=["ts_code", "trade_date"]
+    )
+
+
 def build_market_table(
     con,
     stock_basic_df: pd.DataFrame,
     daily_df: pd.DataFrame,
     moneyflow_df: pd.DataFrame | None = None,
+    index_daily_df: pd.DataFrame | None = None,
 ) -> None:
     stock_df = normalize_stock_basic(stock_basic_df)
     price_df = normalize_daily(daily_df)
@@ -279,6 +361,15 @@ def build_market_table(
 
     write_dataframe(con, "dim_stock", stock_df)
     write_dataframe(con, "analytics_market_daily", analytics_df)
+    save_processed_dataset(analytics_df, "analytics_market_daily")
+
+    quality_report_df = build_quality_report(analytics_df, "analytics_market_daily", ["ts_code", "trade_date"])
+    write_dataframe(con, "data_quality_report", quality_report_df)
+
+    index_df = normalize_index_daily(index_daily_df)
+    if index_df is not None:
+        write_dataframe(con, "analytics_index_daily", index_df)
+        save_processed_dataset(index_df, "analytics_index_daily")
 
 
 def run(start_date: str | None, end_date: str | None, datasets: list[str], keep_going: bool, pause: float) -> None:
@@ -298,7 +389,7 @@ def run(start_date: str | None, end_date: str | None, datasets: list[str], keep_
             continue
 
         print(f"{dataset_name}: {len(df)} rows")
-        save_raw_csv(df, dataset_name)
+        save_raw_dataset(df, dataset_name)
         write_dataframe(con, f"raw_{dataset_name}", df)
         fetched_data[dataset_name] = df
 
@@ -308,10 +399,14 @@ def run(start_date: str | None, end_date: str | None, datasets: list[str], keep_
             fetched_data["stock_basic"],
             fetched_data["daily"],
             fetched_data.get("moneyflow"),
+            fetched_data.get("index_daily"),
         )
         print("Built analytics_market_daily.")
     else:
         print("Skipped analytics_market_daily: stock_basic and daily are required.")
+
+    con.close()
+    snapshot_database()
 
 
 def parse_args() -> argparse.Namespace:
@@ -325,7 +420,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--datasets",
         nargs="+",
-        default=["stock_basic", "daily", "moneyflow", "limit_list_d"],
+        default=["stock_basic", "daily", "moneyflow", "limit_list_d", "index_daily"],
         choices=sorted(DEFAULT_DATASETS.keys()),
         help="Datasets to fetch.",
     )
