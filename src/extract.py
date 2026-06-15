@@ -1,4 +1,5 @@
 import argparse
+import os
 import shutil
 import time
 from datetime import datetime, timedelta
@@ -144,14 +145,18 @@ def build_sample_data(days: int = 60) -> tuple[pd.DataFrame, pd.DataFrame, pd.Da
 
 
 def run_sample(days: int) -> None:
-    con = connect()
-    stock_basic_df, daily_df, moneyflow_df = build_sample_data(days)
-    write_dataframe(con, "raw_stock_basic", stock_basic_df)
-    write_dataframe(con, "raw_daily", daily_df)
-    write_dataframe(con, "raw_moneyflow", moneyflow_df)
-    build_market_table(con, stock_basic_df, daily_df, moneyflow_df)
-    con.close()
-    snapshot_database()
+    temp_db_path = build_temp_db_path()
+    con = connect(temp_db_path)
+    try:
+        stock_basic_df, daily_df, moneyflow_df = build_sample_data(days)
+        write_dataframe(con, "raw_stock_basic", stock_basic_df)
+        write_dataframe(con, "raw_daily", daily_df)
+        write_dataframe(con, "raw_moneyflow", moneyflow_df)
+        build_market_table(con, stock_basic_df, daily_df, moneyflow_df)
+    finally:
+        con.close()
+
+    publish_database(temp_db_path)
     print(f"Built sample analytics_market_daily with {len(daily_df)} rows.")
 
 
@@ -178,6 +183,20 @@ def snapshot_database() -> None:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     snapshot_path = SNAPSHOT_DIR / f"market_analytics_{timestamp}.duckdb"
     shutil.copy2(DB_PATH, snapshot_path)
+
+
+def build_temp_db_path() -> Path:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return DB_PATH.parent / f"market_analytics_build_{timestamp}_{os.getpid()}.duckdb"
+
+
+def publish_database(temp_db_path: Path) -> None:
+    if not temp_db_path.exists():
+        return
+    if DB_PATH.exists():
+        snapshot_database()
+    os.replace(temp_db_path, DB_PATH)
 
 
 def fetch_by_trade_date(
@@ -374,39 +393,42 @@ def build_market_table(
 
 def run(start_date: str | None, end_date: str | None, datasets: list[str], keep_going: bool, pause: float) -> None:
     client = TushareClient()
-    con = connect()
+    temp_db_path = build_temp_db_path()
+    con = connect(temp_db_path)
     fetched_data = {}
 
-    for dataset_name in datasets:
-        dataset = DEFAULT_DATASETS[dataset_name]
-        print(f"Fetching {dataset_name}...")
-        try:
-            df = fetch_dataset(client, dataset_name, start_date, end_date, pause)
-        except Exception as exc:
-            if dataset.get("required") and not keep_going:
-                raise
-            print(f"Skipped {dataset_name}: {exc}")
-            continue
+    try:
+        for dataset_name in datasets:
+            dataset = DEFAULT_DATASETS[dataset_name]
+            print(f"Fetching {dataset_name}...")
+            try:
+                df = fetch_dataset(client, dataset_name, start_date, end_date, pause)
+            except Exception as exc:
+                if dataset.get("required") and not keep_going:
+                    raise
+                print(f"Skipped {dataset_name}: {exc}")
+                continue
 
-        print(f"{dataset_name}: {len(df)} rows")
-        save_raw_dataset(df, dataset_name)
-        write_dataframe(con, f"raw_{dataset_name}", df)
-        fetched_data[dataset_name] = df
+            print(f"{dataset_name}: {len(df)} rows")
+            save_raw_dataset(df, dataset_name)
+            write_dataframe(con, f"raw_{dataset_name}", df)
+            fetched_data[dataset_name] = df
 
-    if "stock_basic" in fetched_data and "daily" in fetched_data:
-        build_market_table(
-            con,
-            fetched_data["stock_basic"],
-            fetched_data["daily"],
-            fetched_data.get("moneyflow"),
-            fetched_data.get("index_daily"),
-        )
-        print("Built analytics_market_daily.")
-    else:
-        print("Skipped analytics_market_daily: stock_basic and daily are required.")
+        if "stock_basic" in fetched_data and "daily" in fetched_data:
+            build_market_table(
+                con,
+                fetched_data["stock_basic"],
+                fetched_data["daily"],
+                fetched_data.get("moneyflow"),
+                fetched_data.get("index_daily"),
+            )
+            print("Built analytics_market_daily.")
+        else:
+            print("Skipped analytics_market_daily: stock_basic and daily are required.")
+    finally:
+        con.close()
 
-    con.close()
-    snapshot_database()
+    publish_database(temp_db_path)
 
 
 def parse_args() -> argparse.Namespace:
