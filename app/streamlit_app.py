@@ -403,6 +403,24 @@ def get_selected_benchmark_return(index_df, selected_date):
 
 
 def clean_market_data(df):
+    required_columns = {
+        "ts_code",
+        "trade_date",
+        "name",
+        "industry",
+        "market",
+        "close",
+        "pct_chg",
+        "amount_100m",
+        "amplitude",
+        "is_up",
+        "is_limit_up_proxy",
+        "is_limit_down_proxy",
+        "net_mf_amount_100m",
+    }
+    if df.empty or not required_columns.issubset(df.columns):
+        return pd.DataFrame()
+
     cleaned = df.copy()
     cleaned["trade_date"] = pd.to_datetime(cleaned["trade_date"], errors="coerce")
     for column in ["industry", "market", "name", "ts_code"]:
