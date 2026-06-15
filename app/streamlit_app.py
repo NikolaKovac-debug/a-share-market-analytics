@@ -1,8 +1,10 @@
 from pathlib import Path
 import gc
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -82,7 +84,13 @@ COLUMN_LABELS = {
 def get_connection():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     if DB_PATH.exists():
-        return duckdb.connect(str(DB_PATH), read_only=True)
+        runtime_dir = Path(tempfile.gettempdir()) / "a_share_market_analytics"
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        db_copy_path = runtime_dir / f"market_analytics_read_{os.getpid()}.duckdb"
+        if db_copy_path.exists():
+            db_copy_path.unlink()
+        shutil.copy2(DB_PATH, db_copy_path)
+        return duckdb.connect(str(db_copy_path), read_only=True)
     return duckdb.connect(str(DB_PATH))
 
 
