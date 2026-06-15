@@ -81,6 +81,8 @@ COLUMN_LABELS = {
 @st.cache_resource
 def get_connection():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if DB_PATH.exists():
+        return duckdb.connect(str(DB_PATH), read_only=True)
     return duckdb.connect(str(DB_PATH))
 
 
@@ -232,8 +234,11 @@ def choose_source_table(con):
         if row_count > 0:
             return ANALYTICS_TABLE, "Tushare / DuckDB 真实数据表"
 
-    ensure_demo_data(con)
-    return DEMO_TABLE, "DuckDB 示例数据表"
+    try:
+        ensure_demo_data(con)
+        return DEMO_TABLE, "DuckDB 示例数据表"
+    except duckdb.Error:
+        return ANALYTICS_TABLE, "Tushare / DuckDB 真实数据表"
 
 
 def load_market_data(con, table_name):
