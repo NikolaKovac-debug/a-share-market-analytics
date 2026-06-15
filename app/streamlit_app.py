@@ -246,10 +246,16 @@ def choose_source_table(con):
         ensure_demo_data(con)
         return DEMO_TABLE, "DuckDB 示例数据表"
     except duckdb.Error:
-        return ANALYTICS_TABLE, "Tushare / DuckDB 真实数据表"
+        return None, "暂无可用数据表"
 
 
 def load_market_data(con, table_name):
+    if not table_name:
+        return pd.DataFrame()
+
+    if not table_exists(con, table_name):
+        return pd.DataFrame()
+
     columns = {
         row[0]
         for row in con.execute(
@@ -544,6 +550,10 @@ if st.button("拉取 / 更新真实数据", type="primary"):
 con = get_connection()
 source_table, source_label = choose_source_table(con)
 market_df = clean_market_data(load_market_data(con, source_table))
+if market_df.empty:
+    st.info("暂无可用行情数据。请先确认 Streamlit Secrets 中已配置 TUSHARE_TOKEN，然后点击左侧上方按钮拉取 / 更新真实数据。")
+    st.stop()
+
 index_df = load_index_data(con)
 quality_report_df = load_quality_report(con)
 if quality_report_df.empty and not market_df.empty:
